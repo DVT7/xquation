@@ -1,0 +1,914 @@
+import { useRoute, Link, useLocation } from "wouter";
+import {
+  useGetFormula, useListFormulas, useListConstants, useListGlossaryTerms,
+  useListFavorites, useAddFavorite, useRemoveFavorite, getListFavoritesQueryKey,
+  useRecordFormulaView,
+} from "@workspace/api-client-react";
+import { useQueryClient } from "@tanstack/react-query";
+import { useState, useMemo, useEffect, useRef } from "react";
+import { useAuth } from "@workspace/replit-auth-web";
+import { useAppSettings } from "@/contexts/app-settings";
+import { Card, CardContent, CardHeader, CardTitle, CardDescription } from "@/components/ui/card";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
+import { Skeleton } from "@/components/ui/skeleton";
+import { Badge } from "@/components/ui/badge";
+import { BlockMath, ColoredBlockMath } from "@/components/ui/math";
+import { FormulaVisual } from "@/components/formula/formula-visual";
+import { SymbolCards } from "@/components/formula/symbol-cards";
+import {
+  Star, Copy, Check, ChevronLeft, ChevronRight, ArrowUp,
+  RotateCcw, ChevronDown, ChevronUp, Lightbulb, BookOpen,
+  FlaskConical, Calculator, Atom, LogIn, Sparkles,
+} from "lucide-react";
+import {
+  matchRelatedFormulas,
+  matchRelatedConstants,
+  matchRelatedTopics,
+} from "@/lib/formula-matchmaking";
+import { CALCULATORS, parseStoredCalculator, type SolveMode } from "@/lib/formula-calculators";
+import { WORKED_EXAMPLES } from "@/lib/formula-worked-examples";
+import { FORMULA_RELATED } from "@/lib/formula-related";
+import { FORMULA_PROBLEMS, DIFFICULTY_COLORS, DIFFICULTY_LABELS, parseStoredFormulaProblems, type StoredFormulaProblem } from "@/lib/formula-problems";
+import { emitAchievementEvent } from "@/lib/achievement-events";
+import { cn } from "@/lib/utils";
+
+/* ─── Inline Calculator ──────────────────────────────────────────────────── */
+
+function FormulaCalc({
+  formulaId,
+  formulaLatex,
+  calculator,
+}: {
+  formulaId: number;
+  formulaLatex?: string;
+  calculator?: string | null;
+}) {
+  const config = CALCULATORS[formulaId] ?? parseStoredCalculator(calculator);
+
+  // Build a unified modes list: index 0 = default, rest = solveModes
+  const modes: Array<{
+    key: string; label: string; unit: string; latex?: string;
+    inputs: typeof config extends undefined ? never : typeof config.inputs;
+    calculate: (v: Record<string, number>) => number;
+    steps: (v: Record<string, number>, r: number) => string[];
+  }> = config ? [
+    { key: "__default__", label: config.outputLabel, unit: config.outputUnit, latex: formulaLatex, inputs: config.inputs, calculate: config.calculate, steps: config.steps },
+    ...(config.solveModes ?? []).map((m: SolveMode) => ({
+      key: m.key, label: m.label, unit: m.unit, latex: m.latex, inputs: m.inputs, calculate: m.calculate, steps: m.steps,
+    })),
+  ] : [];
+
+  const [modeIdx, setModeIdx] = useState(0);
+  const [formulaKey, setFormulaKey] = useState(0);
+  const activeMode = modes[modeIdx] ?? modes[0];
+
+  const [inputs, setInputs] = useState<Record<string, string>>(
+    () => Object.fromEntries(activeMode?.inputs.map(f => [f.key, f.default ?? ""]) ?? [])
+  );
+  const [result, setResult] = useState<number | null>(null);
+  const [steps, setSteps] = useState<string[]>([]);
+  const [copied, setCopied] = useState(false);
+  const [calculationError, setCalculationError] = useState<string | null>(null);
+
+  if (!config) return (
+    <p className="text-center py-8 text-muted-foreground text-sm italic">
+      Interactive calculator coming soon for this formula.
+    </p>
+  );
+
+  const switchMode = (idx: number) => {
+    const m = modes[idx];
+    setModeIdx(idx);
+    setFormulaKey(k => k + 1);
+    setInputs(Object.fromEntries(m.inputs.map(f => [f.key, f.default ?? ""])));
+    setResult(null);
+    setSteps([]);
+    setCalculationError(null);
+  };
+
+  const numeric = Object.fromEntries(Object.entries(inputs).map(([k, v]) => [k, parseFloat(v)]));
+  const allFilled = Object.values(numeric).every(v => !isNaN(v));
+
+  const calculate = () => {
+    if (!allFilled) return;
+    try {
+      const r = activeMode.calculate(numeric);
+      if (!Number.isFinite(r)) throw new Error("This combination of values has no finite result.");
+      setResult(r);
+      setSteps(activeMode.steps(numeric, r));
+      setCalculationError(null);
+    } catch {
+      setResult(null);
+      setSteps([]);
+      setCalculationError("Check the values and try again.");
+    }
+  };
+
+  const reset = () => {
+    setInputs(Object.fromEntries(activeMode.inputs.map(f => [f.key, f.default ?? ""])));
+    setResult(null); setSteps([]);
+    setCalculationError(null);
+  };
+
+  const fmt = (n: number) =>
+    isNaN(n) ? "Undefined"
+    : Math.abs(n) > 1e6 || (Math.abs(n) < 1e-3 && n !== 0) ? n.toExponential(4)
+    : n.toPrecision(5);
+
+  const displayLatex = activeMode.latex ?? config.formulaLatex;
+
+  return (
+    <div className="space-y-5">
+      {displayLatex && (
+        <div
+          key={formulaKey}
+          className="flex justify-center py-4 px-6 bg-card/60 border border-border/40 rounded-xl animate-in fade-in zoom-in-95 duration-300"
+        >
+          <BlockMath math={displayLatex} />
+        </div>
+      )}
+
+      {modes.length > 1 && (
+        <div className="flex items-center gap-3 p-3 bg-muted/20 border border-border/40 rounded-lg">
+          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider shrink-0">Solve for</span>
+          <Select value={String(modeIdx)} onValueChange={v => switchMode(Number(v))}>
+            <SelectTrigger className="h-8 text-sm font-mono border-primary/30 bg-card focus:ring-primary/50">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {modes.map((m, i) => (
+                <SelectItem key={i} value={String(i)} className="font-mono text-sm">
+                  {m.label}{m.unit ? ` (${m.unit})` : ""}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        {activeMode.inputs.map(field => (
+          <div key={field.key}>
+            <Label className="text-xs text-muted-foreground mb-1 block">
+              {field.label}{field.unit ? <span className="text-primary/60 ml-1">({field.unit})</span> : ""}
+            </Label>
+            <Input
+              className="font-mono"
+              placeholder="Enter value"
+              value={inputs[field.key] ?? ""}
+              onChange={e => { setInputs(p => ({ ...p, [field.key]: e.target.value })); setResult(null); }}
+            />
+          </div>
+        ))}
+      </div>
+
+      <div className="flex gap-2">
+        <Button className="flex-1" onClick={calculate} disabled={!allFilled}>
+          <Calculator className="w-4 h-4 mr-2" /> Calculate
+        </Button>
+        <Button variant="outline" size="icon" onClick={reset} title="Reset"><RotateCcw className="w-4 h-4" /></Button>
+      </div>
+
+      {calculationError && (
+        <p className="text-sm text-red-400 border border-red-400/20 bg-red-400/5 rounded-lg px-3 py-2">
+          {calculationError}
+        </p>
+      )}
+
+      {result !== null && (
+        <div className="space-y-3 animate-in fade-in slide-in-from-bottom-2 duration-300">
+          <div className="p-4 bg-primary/10 border border-primary/30 rounded-lg">
+            <div className="text-xs text-muted-foreground mb-1 font-mono uppercase tracking-wider">{activeMode.label}</div>
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-2xl font-mono font-bold text-primary">
+                {fmt(result)}{" "}
+                <span className="text-base font-normal text-muted-foreground">{activeMode.unit}</span>
+              </div>
+              <Button variant="ghost" size="icon" onClick={() => { navigator.clipboard.writeText(`${result} ${activeMode.unit}`); setCopied(true); setTimeout(() => setCopied(false), 1500); }}>
+                {copied ? <Check className="w-4 h-4 text-green-400" /> : <Copy className="w-4 h-4" />}
+              </Button>
+            </div>
+          </div>
+          {steps.length > 0 && (
+            <div className="bg-muted/20 border border-border/40 rounded-lg p-4">
+              <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider mb-3">Step-by-Step</p>
+              <ol className="space-y-1.5">
+                {steps.map((s, i) => (
+                  <li key={i} className="flex gap-3 text-sm font-mono">
+                    <span className="text-primary/60 font-bold shrink-0 w-4">{i + 1}.</span>
+                    <span className="text-foreground/80">{s}</span>
+                  </li>
+                ))}
+              </ol>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Worked Example ─────────────────────────────────────────────────────── */
+
+function WorkedExampleSection({ formulaId, latex, variables }: { formulaId: number; latex: string; variables?: string | null }) {
+  const ex = WORKED_EXAMPLES[formulaId];
+  if (!ex) return null;
+
+  return (
+    <Card className="border-border/50 bg-card">
+      <CardHeader className="border-b border-border/50 pb-4">
+        <CardTitle className="text-lg font-mono flex items-center gap-2">
+          <BookOpen className="w-5 h-5 text-primary" /> Worked Example
+        </CardTitle>
+        <CardDescription>A fully solved problem using this formula.</CardDescription>
+      </CardHeader>
+      <CardContent className="pt-6 space-y-5">
+
+        {/* Problem */}
+        <div>
+          <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Problem</p>
+          <p className="text-foreground leading-relaxed">{ex.problem}</p>
+        </div>
+
+        {/* Formula reminder */}
+        <div>
+          <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Formula</p>
+          <div className="bg-background/60 border border-border/40 rounded-lg px-4 py-3 overflow-x-auto">
+            <ColoredBlockMath math={latex} variables={variables} />
+          </div>
+        </div>
+
+        {/* Given */}
+        <div>
+          <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Given</p>
+          <div className="flex flex-wrap gap-2">
+            {ex.given.map((g, i) => (
+              <div key={i} className="flex items-center gap-2 bg-[#00BFFF]/10 border border-[#00BFFF]/30 rounded-lg px-3 py-1.5">
+                <span className="font-mono text-[#00BFFF] font-bold text-sm">{g.symbol}</span>
+                <span className="text-foreground/70 text-sm">=</span>
+                <span className="font-mono text-foreground font-semibold text-sm">{g.value}</span>
+                <span className="text-muted-foreground text-xs">({g.description})</span>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        {/* Constants */}
+        {ex.constants && ex.constants.length > 0 && (
+          <div>
+            <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Constants</p>
+            <div className="flex flex-wrap gap-2">
+              {ex.constants.map((c, i) => (
+                <div key={i} className="flex items-center gap-2 bg-[#FFD700]/10 border border-[#FFD700]/30 rounded-lg px-3 py-1.5">
+                  <span className="font-mono text-[#FFD700] font-bold text-sm">{c.symbol}</span>
+                  <span className="text-foreground/70 text-sm">=</span>
+                  <span className="font-mono text-foreground font-semibold text-sm">{c.value}</span>
+                  <span className="text-muted-foreground text-xs">({c.description})</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Substitute */}
+        <div>
+          <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Substitute</p>
+          <div className="bg-background/60 border border-border/40 rounded-lg px-4 py-3 overflow-x-auto">
+            <BlockMath math={ex.substituteLatex} />
+          </div>
+        </div>
+
+        {/* Result */}
+        <div>
+          <p className="text-xs font-bold uppercase tracking-wider text-muted-foreground mb-2">Result</p>
+          <div className="bg-background/60 border border-border/40 rounded-lg px-4 py-3 overflow-x-auto">
+            <BlockMath math={ex.resultLatex} />
+          </div>
+        </div>
+
+        {/* Final Answer */}
+        <div className="bg-primary/10 border border-primary/30 rounded-lg p-4">
+          <p className="text-xs font-bold uppercase tracking-wider text-primary/80 mb-1">Final Answer</p>
+          <p className="text-xl font-mono font-bold text-primary">{ex.finalAnswer}</p>
+        </div>
+      </CardContent>
+    </Card>
+  );
+}
+
+/* ─── Practice Problem Card ──────────────────────────────────────────────── */
+
+function ProblemCard({ problem, index }: { problem: StoredFormulaProblem; index: number }) {
+  const [showHint, setShowHint] = useState(false);
+  const [showSolution, setShowSolution] = useState(false);
+  const color = DIFFICULTY_COLORS[problem.difficulty] ?? "#00D9FF";
+  const label = DIFFICULTY_LABELS[problem.difficulty] ?? "";
+
+  return (
+    <div className="border border-border/50 rounded-lg bg-card overflow-hidden">
+      <div className="p-4">
+        <div className="flex items-start gap-3 mb-3">
+          <span className="font-mono text-muted-foreground/60 text-sm shrink-0 pt-0.5">#{index + 1}</span>
+          <div className="flex-1">
+            <div className="flex items-center gap-2 mb-2 flex-wrap">
+              <span
+                className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border"
+                style={{ color, borderColor: `${color}50`, backgroundColor: `${color}15` }}
+              >
+                Level {problem.difficulty} — {label}
+              </span>
+            </div>
+            <p className="text-sm text-foreground/90 leading-relaxed">{problem.question}</p>
+          </div>
+        </div>
+
+        <div className="flex gap-2 ml-7">
+          {problem.hint && (
+            <button
+              onClick={() => setShowHint(v => !v)}
+              className="flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-300 transition-colors font-mono"
+            >
+              <Lightbulb className="w-3.5 h-3.5" />
+              {showHint ? "Hide Hint" : "Show Hint"}
+            </button>
+          )}
+          <button
+            onClick={() => setShowSolution(v => !v)}
+            className="flex items-center gap-1.5 text-xs text-primary hover:text-primary/80 transition-colors font-mono"
+          >
+            {showSolution ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            {showSolution ? "Hide Solution" : "Show Solution"}
+          </button>
+        </div>
+      </div>
+
+      {showHint && (
+        <div className="mx-4 mb-3 p-3 bg-amber-500/10 border border-amber-500/20 rounded-md text-sm text-amber-300/90 font-mono animate-in fade-in duration-200">
+          💡 {problem.hint}
+        </div>
+      )}
+
+      {problem.variables && problem.variables.length > 0 && (
+        <div className="mx-4 mb-3 flex flex-wrap gap-2">
+          {problem.variables.map((variable, i) => (
+            <div key={`${variable.symbol}-${i}`} className="flex items-center gap-1.5 rounded-md border border-[#00BFFF]/20 bg-[#00BFFF]/5 px-2.5 py-1">
+              <span className="font-mono text-xs font-bold text-[#00BFFF]">{variable.symbol}</span>
+              <span className="text-xs text-muted-foreground">=</span>
+              <span className="font-mono text-xs text-foreground">{variable.value}</span>
+              {variable.unit && <span className="text-[10px] text-muted-foreground">{variable.unit}</span>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {showSolution && (
+        <div className="mx-4 mb-4 space-y-2 animate-in fade-in slide-in-from-top-1 duration-200">
+          <div className="bg-muted/20 border border-border/40 rounded-md p-3">
+            <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider mb-2">Solution</p>
+            <ol className="space-y-1">
+              {problem.solution.map((step, i) => (
+                <li key={i} className="flex gap-2 text-sm font-mono">
+                  <span className="text-primary/60 shrink-0">{i + 1}.</span>
+                  <span className="text-foreground/80">{step}</span>
+                </li>
+              ))}
+            </ol>
+          </div>
+          <div className="bg-primary/10 border border-primary/30 rounded-md p-3">
+            <span className="text-xs font-bold text-primary/80 uppercase tracking-wider mr-2">Answer:</span>
+            <span className="font-mono text-primary font-semibold">{problem.answer}</span>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ─── Difficulty Legend ──────────────────────────────────────────────────── */
+
+function DifficultyLegend() {
+  return (
+    <div className="flex flex-wrap gap-2">
+      {Object.entries(DIFFICULTY_LABELS).map(([level, label]) => {
+        const color = DIFFICULTY_COLORS[parseInt(level)];
+        return (
+          <div key={level} className="flex items-center gap-1.5 text-[10px]">
+            <span className="w-2.5 h-2.5 rounded-full" style={{ backgroundColor: color }} />
+            <span className="text-muted-foreground font-mono">{label}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function parseSelectedIds(raw?: string | null): number[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (Array.isArray(parsed)) {
+      return parsed.filter((id): id is number => Number.isInteger(id) && id > 0);
+    }
+  } catch {
+    // Older formula records used comma-separated names.
+  }
+  return [];
+}
+
+/* ─── Main Page ──────────────────────────────────────────────────────────── */
+
+export default function FormulaDetail() {
+  const [, params] = useRoute("/formulas/:id");
+  const id = parseInt(params?.id ?? "0", 10);
+
+  const { data: formula, isLoading } = useGetFormula(id);
+  const { data: allFormulas } = useListFormulas({});
+  const { data: allConstants } = useListConstants({});
+  const { data: allGlossaryTerms } = useListGlossaryTerms({});
+  const { data: favorites } = useListFavorites();
+  const addFavorite = useAddFavorite();
+  const removeFavorite = useRemoveFavorite();
+  const queryClient = useQueryClient();
+  const [latexCopied, setLatexCopied] = useState(false);
+  const { isAuthenticated, login } = useAuth();
+  const recordView = useRecordFormulaView();
+  const viewFiredRef = useRef(false);
+  const { setLastVisited } = useAppSettings();
+
+  useEffect(() => {
+    viewFiredRef.current = false;
+    if (!isAuthenticated || !id) return;
+    const timer = setTimeout(() => {
+      if (!viewFiredRef.current) {
+        viewFiredRef.current = true;
+        recordView.mutate({ id });
+      }
+    }, 60_000);
+    return () => clearTimeout(timer);
+  }, [id, isAuthenticated]);
+
+  // Track formula name for "pick up where you left off" + page title
+  useEffect(() => {
+    if (!formula) return;
+    const label = formula.name;
+    setLastVisited({ path: `/formulas/${id}`, label });
+    document.title = `${label} — Formula Page | XQuation`;
+    // SEO meta description
+    let meta = document.querySelector('meta[name="description"]') as HTMLMetaElement | null;
+    if (!meta) {
+      meta = document.createElement("meta");
+      meta.name = "description";
+      document.head.appendChild(meta);
+    }
+    meta.content = `Learn about the ${label} formula on XQuation. Includes LaTeX, visualizations, worked examples, and practice problems.`;
+    return () => {
+      document.title = "XQuation";
+      if (meta) meta.content = "Explore physics and astronomy formulas, constants, calculators, and more on XQuation.";
+    };
+  }, [formula, id]);
+
+  const sortedAll = useMemo(() => allFormulas ?? [], [allFormulas]);
+  const currentIdx = sortedAll.findIndex(f => f.id === id);
+  const prevF = currentIdx > 0 ? sortedAll[currentIdx - 1] : null;
+  const nextF = currentIdx < sortedAll.length - 1 ? sortedAll[currentIdx + 1] : null;
+
+  const isFav = useMemo(() => (favorites ?? []).some(f => f.itemType === "formula" && f.itemId === id), [favorites, id]);
+  const favEntry = useMemo(() => (favorites ?? []).find(f => f.itemType === "formula" && f.itemId === id), [favorites, id]);
+
+  const toggleFav = () => {
+    if (isFav && favEntry) {
+      removeFavorite.mutate({ id: favEntry.id }, { onSuccess: () => queryClient.invalidateQueries({ queryKey: getListFavoritesQueryKey() }) });
+    } else if (formula) {
+      addFavorite.mutate({ data: { itemType: "formula", itemId: id, itemName: formula.name } }, { onSuccess: () => queryClient.invalidateQueries({ queryKey: getListFavoritesQueryKey() }) });
+    }
+  };
+
+  const copyLatex = () => {
+    if (formula?.latex) { navigator.clipboard.writeText(formula.latex); setLatexCopied(true); setTimeout(() => setLatexCopied(false), 2000); }
+  };
+
+  const related = FORMULA_RELATED[id];
+  const storedProblems = useMemo(() => parseStoredFormulaProblems(formula?.problems), [formula?.problems]);
+  const problems = [...(storedProblems.length > 0 ? storedProblems : (FORMULA_PROBLEMS[id] ?? []))]
+    .sort((a, b) => a.difficulty - b.difficulty);
+
+  // ── Curated related formulas (from DB field) ──────────────────────────────
+  const curatedFormulaObjs = useMemo(() => {
+    if (!formula?.relatedFormulas) return [];
+    const selectedIds = parseSelectedIds(formula.relatedFormulas);
+    if (selectedIds.length > 0) {
+      return selectedIds
+        .map((selectedId) => sortedAll.find((item) => item.id === selectedId))
+        .filter((item): item is NonNullable<typeof item> => !!item)
+        .map((selectedFormula) => ({ formula: selectedFormula, isAutoMatched: false as const }));
+    }
+    const names = formula.relatedFormulas.split(",").map(s => s.trim()).filter(Boolean);
+    return names
+      .map(name => ({ formula: sortedAll.find(f => f.name.toLowerCase().includes(name.toLowerCase())), isAutoMatched: false }))
+      .filter((x): x is { formula: NonNullable<typeof x.formula>; isAutoMatched: false } => !!x.formula);
+  }, [formula, sortedAll]);
+
+  // ── Matchmade related formulas (padded in when curated list is short) ─────
+  const relatedFormulaObjs = useMemo(() => {
+    const curatedIds = new Set(curatedFormulaObjs.map(x => x.formula.id));
+    const auto = matchRelatedFormulas(id, sortedAll, 8)
+      .filter(m => !curatedIds.has(m.formula.id))
+      .slice(0, Math.max(0, 6 - curatedFormulaObjs.length))
+      .map(m => ({ formula: m.formula, isAutoMatched: true }));
+    return [...curatedFormulaObjs, ...auto];
+  }, [id, sortedAll, curatedFormulaObjs]);
+
+  // ── Curated constants (selected IDs for new formulas, legacy map otherwise) ─
+  const curatedConstantObjs = useMemo(
+    () => {
+      const selectedIds = parseSelectedIds(formula?.relatedConstants);
+      const ids = selectedIds.length > 0 ? selectedIds : (related?.constantIds ?? []);
+      return (allConstants ?? []).filter(c => ids.includes(c.id)).map(c => ({ constant: c, isAutoMatched: false }));
+    },
+    [allConstants, formula?.relatedConstants, related]
+  );
+
+  // ── Matchmade constants (padded in when curated list is short) ────────────
+  const relatedConstantObjs = useMemo(() => {
+    const curatedIds = new Set(curatedConstantObjs.map(x => x.constant.id));
+    const auto = matchRelatedConstants(id, sortedAll, allConstants ?? [], 8)
+      .filter(m => !curatedIds.has(m.constant.id))
+      .slice(0, Math.max(0, 4 - curatedConstantObjs.length))
+      .map(m => ({ constant: m.constant, isAutoMatched: true }));
+    return [...curatedConstantObjs, ...auto];
+  }, [id, sortedAll, allConstants, curatedConstantObjs]);
+
+  // ── Selected glossary terms + legacy topics + matchmade topics ────────────
+  const allTopics = useMemo(() => {
+    const selectedGlossaryIds = parseSelectedIds(formula?.relatedGlossary);
+    const selectedGlossary = (allGlossaryTerms ?? [])
+      .filter((term) => selectedGlossaryIds.includes(term.id))
+      .map((term) => term.term);
+    const curated = [...selectedGlossary, ...(related?.topics ?? [])].filter((topic, index, items) => items.indexOf(topic) === index);
+    const curatedSet = new Set(curated);
+    const auto = matchRelatedTopics(id, sortedAll, 8)
+      .filter(m => !curatedSet.has(m.topic))
+      .slice(0, Math.max(0, 8 - curated.length))
+      .map(m => ({ topic: m.topic, isAutoMatched: true }));
+    const curatedItems = curated.map(t => ({ topic: t, isAutoMatched: false }));
+    return [...curatedItems, ...auto];
+  }, [id, sortedAll, related, allGlossaryTerms, formula?.relatedGlossary]);
+
+  const derivationFormulaObjs = useMemo(() => {
+    const selected = related?.derivationFormulaNames ?? [];
+    if (!selected.length && !related?.derivationFormulaNames) {
+      return relatedFormulaObjs.map(({ formula: selectedFormula }) => ({
+        name: selectedFormula.name,
+        formula: selectedFormula,
+      }));
+    }
+    return selected.map(name => ({
+      name,
+      formula: sortedAll.find(f => f.name.toLowerCase().includes(name.toLowerCase())),
+    }));
+  }, [related, sortedAll]);
+
+  const derivationSteps = useMemo(() => {
+    const stored = formula?.derivation
+      ?.split("\n")
+      .map((step) => step.trim())
+      .filter(Boolean) ?? [];
+    return stored.length > 0 ? stored : (related?.derivation ?? []);
+  }, [formula?.derivation, related]);
+
+  if (isLoading) return (
+    <div className="space-y-6 pb-12">
+      <Skeleton className="h-8 w-48" />
+      <Skeleton className="h-10 w-2/3" />
+      <Skeleton className="h-56 w-full" />
+      <Skeleton className="h-48 w-full" />
+    </div>
+  );
+
+  if (!formula) return (
+    <div className="text-center py-20 text-muted-foreground">
+      Formula not found.{" "}
+      <Link href="/formulas" className="text-primary hover:underline">Back to Formulas</Link>
+    </div>
+  );
+
+  return (
+    <div className="space-y-8 pb-16 max-w-4xl">
+
+      {/* ── 1. Breadcrumb ─────────────────────────────────────────────── */}
+      <div className="flex items-center gap-2 text-sm text-muted-foreground font-mono flex-wrap">
+        <Link href="/formulas" className="hover:text-primary transition-colors">Formulas</Link>
+        <span>/</span>
+        <Link href={`/formulas?category=${encodeURIComponent(formula.category)}`} className="text-primary/70 hover:text-primary transition-colors">{formula.category}</Link>
+        {formula.subcategory && <><span>/</span><span className="text-primary/50">{formula.subcategory}</span></>}
+      </div>
+
+      {/* ── 1. Title + Category Tags ───────────────────────────────────── */}
+      <div className="flex flex-col sm:flex-row sm:items-start gap-4 justify-between">
+        <div>
+          <h1 className="text-3xl font-bold font-mono mb-3">{formula.name}</h1>
+          <div className="flex flex-wrap gap-2">
+            <Badge className="bg-primary/10 text-primary border-primary/30 font-mono text-xs hover:bg-primary/20 transition-colors cursor-default">
+              {formula.category}
+            </Badge>
+            {formula.subcategory && (
+              <Badge variant="outline" className="text-muted-foreground text-xs font-mono border-border/50 cursor-default">
+                {formula.subcategory}
+              </Badge>
+            )}
+          </div>
+        </div>
+        <div className="flex gap-2 shrink-0">
+          <Button variant="outline" size="sm" onClick={toggleFav}
+            className={cn("gap-1.5 font-mono text-xs border-border/50", isFav ? "text-yellow-400 border-yellow-500/30 bg-yellow-500/10" : "text-muted-foreground")}
+          >
+            <Star className="w-3.5 h-3.5" fill={isFav ? "currentColor" : "none"} />
+            {isFav ? "Saved" : "Save"}
+          </Button>
+          <Button variant="outline" size="sm" onClick={copyLatex}
+            className="gap-1.5 font-mono text-xs border-border/50 text-muted-foreground"
+          >
+            {latexCopied ? <Check className="w-3.5 h-3.5 text-green-400" /> : <Copy className="w-3.5 h-3.5" />}
+            {latexCopied ? "Copied!" : "Copy LaTeX"}
+          </Button>
+        </div>
+      </div>
+
+      {/* ── 2. Color-coded Equation ───────────────────────────────────── */}
+      <Card className="border-border/50 bg-card" onClick={() => emitAchievementEvent("formula_click")}>
+        <CardContent className="pt-6">
+          <div className="bg-background/80 rounded-lg p-8 border border-border/50 flex items-center justify-center overflow-x-auto min-h-[140px] mb-6">
+            <ColoredBlockMath math={formula.latex} variables={formula.variables} />
+          </div>
+
+          {/* ── 3. Symbol Cards ────────────────────────────────────────── */}
+          <SymbolCards variables={formula.variables} />
+
+          <div className="mt-6 flex gap-6 items-start">
+            <FormulaVisual formulaId={id} />
+            <p className="text-sm text-foreground/70 leading-relaxed flex-1">{formula.description}</p>
+          </div>
+          {formula.siUnits && (
+            <div className="flex items-center gap-2 mt-3">
+              <span className="text-xs font-bold text-muted-foreground uppercase tracking-wider">Result Unit:</span>
+              <span className="text-xs font-mono text-green-400 bg-green-400/10 px-2 py-0.5 rounded border border-green-400/20">{formula.siUnits}</span>
+            </div>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── 4. Interactive Calculator ─────────────────────────────────── */}
+      <Card className="border-border/50 bg-card">
+        <CardHeader className="border-b border-border/50 pb-4">
+          <CardTitle className="text-lg font-mono flex items-center gap-2">
+            <Calculator className="w-5 h-5 text-primary" /> Interactive Calculator
+          </CardTitle>
+          <CardDescription>Enter known values to calculate the result with step-by-step working.</CardDescription>
+        </CardHeader>
+        <CardContent className="pt-6">
+          <FormulaCalc formulaId={id} formulaLatex={formula.latex} calculator={formula.calculator} />
+        </CardContent>
+      </Card>
+
+      {/* ── 5. Worked Example ─────────────────────────────────────────── */}
+      <WorkedExampleSection formulaId={id} latex={formula.latex} variables={formula.variables} />
+
+      {formula.example && (
+        <Card className="border-border/50 bg-card">
+          <CardHeader className="border-b border-border/50 pb-4">
+            <CardTitle className="text-lg font-mono flex items-center gap-2">
+              <BookOpen className="w-5 h-5 text-primary" /> Example
+            </CardTitle>
+            <CardDescription>A practical note or example for using this formula.</CardDescription>
+          </CardHeader>
+          <CardContent className="pt-6">
+            <p className="text-sm text-foreground/80 leading-relaxed whitespace-pre-wrap">{formula.example}</p>
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ── 6. Related Formulas ───────────────────────────────────────── */}
+      {relatedFormulaObjs.length > 0 && (
+        <div>
+          <h2 className="text-xl font-bold font-mono mb-4 flex items-center gap-2">
+            <FlaskConical className="w-5 h-5 text-primary" /> Related Formulas
+          </h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {relatedFormulaObjs.map(({ formula: rf, isAutoMatched }) => (
+              <Link key={rf.id} href={`/formulas/${rf.id}`}>
+                <div className={cn(
+                  "flex items-center justify-between p-3 rounded-lg border transition-all group cursor-pointer",
+                  isAutoMatched
+                    ? "border-dashed border-border/40 bg-card/60 hover:border-primary/40 hover:bg-primary/5"
+                    : "border-border/50 bg-card hover:border-primary/50 hover:bg-primary/5"
+                )}>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-semibold text-foreground group-hover:text-primary transition-colors">{rf.name}</span>
+                      {isAutoMatched && (
+                        <span className="inline-flex items-center gap-0.5 text-[10px] font-mono text-primary/50 bg-primary/5 border border-primary/15 px-1.5 py-0.5 rounded-full shrink-0">
+                          <Sparkles className="w-2.5 h-2.5" /> Similar
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs font-mono text-muted-foreground mt-0.5">{rf.category}</div>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors shrink-0 ml-2" />
+                </div>
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── 7. Related Constants ──────────────────────────────────────── */}
+      {relatedConstantObjs.length > 0 && (
+        <div>
+          <h2 className="text-xl font-bold font-mono mb-4 flex items-center gap-2">
+            <Atom className="w-5 h-5 text-[#FFD700]" /> Related Constants
+          </h2>
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            {relatedConstantObjs.map(({ constant: c, isAutoMatched }) => (
+              <Link key={c.id} href={`/constants?search=${encodeURIComponent(c.name)}`}>
+                <div className={cn(
+                  "flex items-center gap-3 p-3 rounded-lg border transition-all cursor-pointer group",
+                  isAutoMatched
+                    ? "border-dashed border-[#FFD700]/15 bg-[#FFD700]/3 hover:border-[#FFD700]/40 hover:bg-[#FFD700]/8"
+                    : "border-[#FFD700]/20 bg-[#FFD700]/5 hover:border-[#FFD700]/50 hover:bg-[#FFD700]/10"
+                )}>
+                  <div className="w-10 h-10 rounded-md bg-[#FFD700]/10 border border-[#FFD700]/20 flex items-center justify-center shrink-0">
+                    <span className="font-mono font-bold text-[#FFD700] text-sm">{c.symbol}</span>
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-sm font-semibold text-foreground group-hover:text-[#FFD700] transition-colors truncate">{c.name}</span>
+                      {isAutoMatched && (
+                        <span className="inline-flex items-center gap-0.5 text-[10px] font-mono text-[#FFD700]/50 bg-[#FFD700]/5 border border-[#FFD700]/15 px-1.5 py-0.5 rounded-full shrink-0">
+                          <Sparkles className="w-2.5 h-2.5" /> Similar
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs font-mono text-muted-foreground truncate">{c.value} {c.units}</div>
+                  </div>
+                  <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-[#FFD700] transition-colors shrink-0" />
+                </div>
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── 8. Related Topics ─────────────────────────────────────────── */}
+      {allTopics.length > 0 && (
+        <div>
+          <h2 className="text-xl font-bold font-mono mb-4 flex items-center gap-2">
+            <BookOpen className="w-5 h-5 text-primary" /> Related Topics
+          </h2>
+          <div className="flex flex-wrap gap-2">
+            {allTopics.map(({ topic, isAutoMatched }) => (
+              <Link key={topic} href={`/glossary?search=${encodeURIComponent(topic)}`}>
+                <div className={cn(
+                  "px-3 py-1.5 rounded-full border text-sm font-mono transition-all cursor-pointer flex items-center gap-1",
+                  isAutoMatched
+                    ? "border-dashed border-border/30 bg-card/60 text-muted-foreground/70 hover:border-primary/40 hover:text-primary/80 hover:bg-primary/5"
+                    : "border-border/50 bg-card text-muted-foreground hover:border-primary/50 hover:text-primary hover:bg-primary/5"
+                )}>
+                  {isAutoMatched && <Sparkles className="w-3 h-3 text-primary/40 shrink-0" />}
+                  {topic}
+                </div>
+              </Link>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── 9. Derivation ─────────────────────────────────────────────── */}
+      {derivationSteps.length > 0 && (
+        <Card className="border-border/50 bg-card">
+          <CardHeader className="border-b border-border/50 pb-4">
+            <CardTitle className="text-lg font-mono">Derivation</CardTitle>
+            <CardDescription>Step-by-step origin of this formula.</CardDescription>
+          </CardHeader>
+          <CardContent className="pt-6">
+            <ol className="space-y-3">
+              {derivationSteps.map((step, i) => (
+                <li key={i} className="flex gap-4">
+                  <div className="flex-shrink-0 w-6 h-6 rounded-full bg-primary/20 border border-primary/30 flex items-center justify-center mt-0.5">
+                    <span className="text-xs font-bold text-primary">{i + 1}</span>
+                  </div>
+                  <p className="text-sm text-foreground/80 leading-relaxed pt-0.5">{step}</p>
+                </li>
+              ))}
+            </ol>
+
+            {/* ── 10. Derivation Formula Cards ───────────────────────── */}
+            {derivationFormulaObjs.length > 0 && (
+              <div className="mt-6 pt-5 border-t border-border/40">
+                <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider mb-3">Formulas Used in This Derivation</p>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {derivationFormulaObjs.map(({ name, formula: df }) =>
+                    df ? (
+                      <Link key={name} href={`/formulas/${df.id}`}>
+                        <div className="flex items-center justify-between p-3 rounded-lg border border-border/50 bg-background/50 hover:border-primary/50 hover:bg-primary/5 transition-all group cursor-pointer">
+                          <div>
+                            <div className="text-sm font-semibold text-foreground group-hover:text-primary transition-colors">{df.name}</div>
+                            <div className="text-xs font-mono text-muted-foreground mt-0.5 opacity-70">{df.latex}</div>
+                          </div>
+                          <ChevronRight className="w-4 h-4 text-muted-foreground group-hover:text-primary transition-colors" />
+                        </div>
+                      </Link>
+                    ) : (
+                      <div key={name} className="p-3 rounded-lg border border-border/30 bg-card/50 text-sm text-muted-foreground">{name}</div>
+                    )
+                  )}
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
+      {/* ── 11. Practice Problems ─────────────────────────────────────── */}
+      {problems.length > 0 && (
+        <div>
+          <div className="flex items-start justify-between gap-4 mb-4">
+            <div>
+              <h2 className="text-xl font-bold font-mono flex items-center gap-2">
+                <FlaskConical className="w-5 h-5 text-primary" /> Practice Problems
+              </h2>
+              <p className="text-sm text-muted-foreground mt-1">{problems.length} problems — ordered easiest to hardest.</p>
+            </div>
+          </div>
+          {!isAuthenticated ? (
+            <div className="flex flex-col items-center gap-4 py-10 px-6 border border-dashed border-border rounded-xl bg-background/40 text-center">
+              <div className="w-14 h-14 rounded-full bg-primary/10 border border-primary/20 flex items-center justify-center">
+                <FlaskConical className="w-7 h-7 text-primary" />
+              </div>
+              <div>
+                <p className="font-semibold text-foreground mb-1">Sign in to access practice problems</p>
+                <p className="text-sm text-muted-foreground">Create a free account to unlock {problems.length} problems with hints and step-by-step solutions.</p>
+              </div>
+              <Button
+                onClick={login}
+                className="gap-2 bg-primary text-primary-foreground hover:bg-primary/90 px-6"
+                size="sm"
+              >
+                <LogIn className="w-4 h-4" />
+                Log In
+              </Button>
+            </div>
+          ) : (
+            <>
+              <div className="mb-4">
+                <p className="text-xs font-bold text-muted-foreground uppercase tracking-wider mb-2">Difficulty Scale</p>
+                <DifficultyLegend />
+              </div>
+              <div className="space-y-3">
+                {problems.map((p, i) => (
+                  <ProblemCard key={i} problem={p} index={i} />
+                ))}
+              </div>
+            </>
+          )}
+        </div>
+      )}
+
+      {/* ── Footer Navigation ─────────────────────────────────────────── */}
+      <div className="border-t border-border/40 pt-6 flex items-center justify-between gap-4">
+        <div>
+          {prevF ? (
+            <Link href={`/formulas/${prevF.id}`}>
+              <Button variant="outline" className="gap-2 font-mono text-xs border-border/50 text-muted-foreground hover:text-primary">
+                <ChevronLeft className="w-4 h-4" />
+                <span className="hidden sm:inline truncate max-w-[160px]">{prevF.name}</span>
+                <span className="sm:hidden">Prev</span>
+              </Button>
+            </Link>
+          ) : <div />}
+        </div>
+        <div className="flex gap-2">
+          <Link href="/formulas">
+            <Button variant="ghost" size="sm" className="font-mono text-xs text-muted-foreground">All Formulas</Button>
+          </Link>
+          <Button variant="ghost" size="icon" onClick={() => window.scrollTo({ top: 0, behavior: "smooth" })} title="Back to top">
+            <ArrowUp className="w-4 h-4" />
+          </Button>
+        </div>
+        <div>
+          {nextF ? (
+            <Link href={`/formulas/${nextF.id}`}>
+              <Button variant="outline" className="gap-2 font-mono text-xs border-border/50 text-muted-foreground hover:text-primary">
+                <span className="hidden sm:inline truncate max-w-[160px]">{nextF.name}</span>
+                <span className="sm:hidden">Next</span>
+                <ChevronRight className="w-4 h-4" />
+              </Button>
+            </Link>
+          ) : <div />}
+        </div>
+      </div>
+    </div>
+  );
+}
